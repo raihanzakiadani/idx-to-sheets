@@ -14,20 +14,25 @@ Required environment variables (set as GitHub Actions secrets):
     SPREADSHEET_ID              - the target Google Sheet's ID (from its URL)
 
 Optional:
-    SCRAPE_DATE      - YYYYMMDD, defaults to today (useful for backfilling/testing)
-    FUND_QUARTER     - fundamentals quarter (1-4), default 4
-    FUND_YEAR        - fundamentals fiscal year, default (current year - 1)
-    PROXY_URL        - e.g. http://user:pass@host:port - route all requests
-                       through this proxy.
-    FLARESOLVERR_URL - e.g. http://localhost:8191/v1 - a running FlareSolverr
-                       instance used to solve IDX's Cloudflare JS challenge
-                       once per run. Defaults to http://localhost:8191/v1,
-                       assuming FlareSolverr is running as a local Docker
-                       container on the same machine as this script (true
-                       for the self-hosted-runner setup this repo uses).
-                       Set to an empty string to disable and fall back to
-                       the plain curl_cffi warm-up (won't work if IDX is
-                       showing a JS challenge rather than a flat IP block).
+    SCRAPE_DATE           - YYYYMMDD, defaults to the last finished trading
+                            day (yesterday, or Friday if today is Monday)
+    FUND_QUARTER          - fundamentals quarter (1-4), default 4
+    FUND_YEAR             - fundamentals fiscal year, default (current year - 1)
+    PROXY_URL             - e.g. http://user:pass@host:port - route all
+                            requests through this proxy.
+    FLARESOLVERR_URL      - e.g. http://localhost:8191/v1 - a running
+                            FlareSolverr instance used to solve IDX's
+                            Cloudflare JS challenge once per run. Defaults
+                            to http://localhost:8191/v1, assuming
+                            FlareSolverr is running as a local Docker
+                            container on the same machine as this script.
+                            Set to an empty string to disable.
+    FETCH_COMPANY_DETAILS - "true" to also pull per-company detail (board,
+                            shareholders, subsidiaries) for every listed
+                            company. This is ~962 individual requests, so
+                            it's off by default - run it on its own
+                            less-frequent schedule (e.g. weekly) rather
+                            than every daily run.
 
 NOTE on 403 errors:
     - A 403 with a generic/plain body usually means IDX's WAF is blocking
@@ -239,6 +244,143 @@ def get_fundamentals(quarter, year):
     return pd.DataFrame(items)
 
 
+# All 13 corporate-action categories IDX's GetIssuedHistory recognizes.
+# The endpoint is filtered per category (no "all" option), so a full
+# corporate-actions pull means one request per category.
+CORPORATE_ACTION_TYPES = [
+    "BuybackSaham",
+    "PrivatePlacement",
+    "stockSplit",
+    "reverseStock",
+    "hmetd",
+    "tanpaHmetd",
+    "dividenSaham",
+    "sahamBonus",
+    "ipo",
+    "waran",
+    "gabungUsaha",
+    "kurangModal",
+    "konversiSaham",
+]
+
+
+def get_corporate_actions(date_from=None, date_to=None):
+    """Corporate actions (buybacks, splits, rights issues, IPOs, etc.) across
+    all categories. date_from/date_to are YYYY-MM-DD strings; leave both
+    None to pull each category's full history (can be slow - the endpoint
+    doesn't support an unfiltered "everything" query)."""
+    frames = []
+    for ca_type in CORPORATE_ACTION_TYPES:
+        params = {"caType": ca_type, "start": 0, "length": 9999}
+        if date_from:
+            params["dateFrom"] = date_from
+        if date_to:
+            params["dateTo"] = date_to
+        try:
+            data = fetch("/ListingActivity/GetIssuedHistory", params)
+            rows = data.get("data", [])
+            if rows:
+                frames.append(pd.DataFrame(rows))
+        except Exception as e:
+            print(f"  -> corporate actions fetch failed for caType={ca_type}: {e}")
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_company_profiles():
+    """Full listed-company directory: ticker, sector, listing board, etc."""
+    data = fetch("/ListedCompany/GetCompanyProfiles", {"start": 0, "length": 9999})
+    return pd.DataFrame(data.get("data", []))
+
+
+def flatten_nested_columns(df):
+    """GetCompanyProfilesDetail returns nested lists/dicts per company
+    (board members, shareholders, subsidiaries...). Sheets cells can only
+    hold scalars, so JSON-encode any column that isn't already scalar."""
+    df = df.copy()
+    for col in df.columns:
+        if df[col].apply(lambda v: isinstance(v, (list, dict))).any():
+            df[col] = df[col].apply(
+                lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+            )
+    return df
+
+
+def get_company_profiles_detail(kode_emiten_list):
+    """Per-company detail (board, shareholders, subsidiaries...). One
+    request per ticker - with ~962 listed companies this is slow and is
+    meant to be run occasionally (e.g. weekly), not on every daily run.
+    See FETCH_COMPANY_DETAILS in main()."""
+    rows = []
+    total = len(kode_emiten_list)
+    for i, code in enumerate(kode_emiten_list, 1):
+        try:
+            data = fetch(
+                "/ListedCompany/GetCompanyProfilesDetail",
+                {"KodeEmiten": code, "language": "id-id"},
+            )
+            row = data.get("data") if isinstance(data.get("data"), dict) else data
+            if row:
+                rows.append(row)
+        except Exception as e:
+            print(f"  -> company detail fetch failed for {code}: {e}")
+        if i % 50 == 0 or i == total:
+            print(f"  -> company details: {i}/{total} fetched")
+    if not rows:
+        return pd.DataFrame()
+    return flatten_nested_columns(pd.DataFrame(rows))
+
+
+def get_broker_directory():
+    """Exchange member / broker directory - maps broker codes (AK, YP, ZP...)
+    to firm names and license types. Reference data, changes rarely."""
+    data = fetch(
+        "/ExchangeMember/GetBrokerSearch",
+        {"option": 0, "license": "", "start": 0, "length": 9999},
+    )
+    return pd.DataFrame(data.get("data", []))
+
+
+def get_announcements(date_from, date_to, lang="id", page_size=100):
+    """Company disclosures & PDF filings for a date range, paginated."""
+    frames = []
+    page = 1
+    while True:
+        data = fetch(
+            "/NewsAnnouncement/GetAllAnnouncement",
+            {
+                "pageNumber": page,
+                "pageSize": page_size,
+                "lang": lang,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+            },
+        )
+        items = data.get("Items", [])
+        if not items:
+            break
+        frames.append(pd.DataFrame(items))
+        page_count = data.get("PageCount", page)
+        if page >= page_count:
+            break
+        page += 1
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_news(page_size=100):
+    """Latest market news headlines - just the first page (this is meant
+    to reflect "recent news", not a full historical archive)."""
+    data = fetch(
+        "/NewsAnnouncement/GetNewsSearch",
+        {"pageNumber": 1, "pageSize": page_size, "locale": "id-id"},
+    )
+    items = data.get("Items") or data.get("data") or []
+    return pd.DataFrame(items)
+
+
 def connect_sheet():
     creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     creds_dict = json.loads(creds_json)
@@ -250,13 +392,15 @@ def connect_sheet():
 
 
 def clean_for_sheets(df):
-    # gspread/Sheets can't take NaN/NaT - blank them out.
+    # gspread/Sheets can't take NaN/NaT, or raw list/dict cells - flatten
+    # and blank those out.
     # astype(object) first is required: on a numeric-dtype column, pandas
     # silently converts None back to NaN when you .where() into it, since
     # a float64 column can't hold a real None. Casting to object dtype
     # first makes the None actually stick, which is what avoids the
     # downstream "Out of range float values are not JSON compliant: nan"
     # error when gspread JSON-encodes the values for the Sheets API.
+    df = flatten_nested_columns(df)
     return df.astype(object).where(pd.notnull(df), None)
 
 
@@ -347,6 +491,51 @@ def main():
         overwrite_snapshot(spreadsheet, "Fundamentals", fund_df)
     except Exception as e:
         print(f"Fundamentals fetch failed: {e}", file=sys.stderr)
+
+    try:
+        ca_df = get_corporate_actions(date_from=None, date_to=None)
+        upsert_timeseries(spreadsheet, "CorporateActions", ca_df, ["id"])
+    except Exception as e:
+        print(f"CorporateActions fetch failed: {e}", file=sys.stderr)
+
+    try:
+        company_df = get_company_profiles()
+        overwrite_snapshot(spreadsheet, "CompanyProfiles", company_df)
+    except Exception as e:
+        print(f"CompanyProfiles fetch failed: {e}", file=sys.stderr)
+        company_df = pd.DataFrame()
+
+    try:
+        broker_dir_df = get_broker_directory()
+        overwrite_snapshot(spreadsheet, "BrokerDirectory", broker_dir_df)
+    except Exception as e:
+        print(f"BrokerDirectory fetch failed: {e}", file=sys.stderr)
+
+    date_iso = f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    try:
+        announce_df = get_announcements(date_from=date_iso, date_to=date_iso)
+        upsert_timeseries(spreadsheet, "Announcements", announce_df, ["Id"])
+    except Exception as e:
+        print(f"Announcements fetch failed: {e}", file=sys.stderr)
+
+    try:
+        news_df = get_news()
+        overwrite_snapshot(spreadsheet, "News", news_df)
+    except Exception as e:
+        print(f"News fetch failed: {e}", file=sys.stderr)
+
+    # Heavy: one request per listed company (~962 of them). Off by default -
+    # set FETCH_COMPANY_DETAILS=true (e.g. on a separate weekly workflow)
+    # to run this.
+    if os.environ.get("FETCH_COMPANY_DETAILS", "false").lower() == "true":
+        try:
+            if company_df.empty:
+                company_df = get_company_profiles()
+            codes = company_df.get("KodeEmiten", pd.Series(dtype=str)).dropna().tolist()
+            detail_df = get_company_profiles_detail(codes)
+            overwrite_snapshot(spreadsheet, "CompanyDetails", detail_df)
+        except Exception as e:
+            print(f"CompanyDetails fetch failed: {e}", file=sys.stderr)
 
     print("Done.")
 
