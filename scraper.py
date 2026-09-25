@@ -31,23 +31,59 @@ from google.oauth2.service_account import Credentials
 
 BASE_URL = "https://www.idx.co.id/primary"
 
-HEADERS = {
+PAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://www.idx.co.id/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+API_HEADERS = {
+    "User-Agent": PAGE_HEADERS["User-Agent"],
+    "Referer": "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
 
 IMPERSONATE = "chrome124"
 
+_session = None
+
+
+def get_session():
+    """Reuse one session so cookies picked up from the homepage carry over
+    into the API calls - many WAFs require this "warm-up" before they'll
+    accept API requests."""
+    global _session
+    if _session is None:
+        _session = requests.Session(impersonate=IMPERSONATE)
+        try:
+            warmup = _session.get(
+                "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham",
+                headers=PAGE_HEADERS,
+                timeout=30,
+            )
+            print(f"Warm-up request status: {warmup.status_code}")
+        except Exception as e:
+            print(f"Warm-up request failed (continuing anyway): {e}")
+    return _session
+
 
 def fetch(path, params):
+    session = get_session()
     url = f"{BASE_URL}{path}"
-    resp = requests.get(
-        url, params=params, headers=HEADERS, impersonate=IMPERSONATE, timeout=30
+    resp = session.get(
+        url, params=params, headers=API_HEADERS, impersonate=IMPERSONATE, timeout=30
     )
+    if resp.status_code != 200:
+        print(f"  -> {url} returned {resp.status_code}")
+        print(f"  -> body preview: {resp.text[:300]!r}")
     resp.raise_for_status()
     return resp.json()
 
