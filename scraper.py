@@ -435,13 +435,18 @@ def get_ksei_download_links():
 
 
 def get_ksei_ownership_for_period(date_str, url):
-    """Download+parse one month's ownership ZIP. We don't know KSEI's exact
-    internal CSV schema for certain (couldn't verify from this sandbox -
-    idx.co.id/ksei.co.id aren't reachable from here), so parsing is
-    intentionally generic: whatever columns are in the CSV are kept as-is,
-    with a PeriodDate column added. If the real column names turn out to
-    need cleanup, send a sample of what actually comes back and this can
-    be tightened up."""
+    """Download+parse one month's ownership ZIP.
+
+    Confirmed file format (pipe-delimited, verified from a real sample):
+      Date|Code|Type|Sec. Num|Price|
+      Local IS|Local CP|Local PF|Local IB|Local ID|Local MF|Local SC|Local FD|Local OT|Total|
+      Foreign IS|Foreign CP|Foreign PF|Foreign IB|Foreign ID|Foreign MF|Foreign SC|Foreign FD|Foreign OT|Total
+    Sector codes: IS=Insurance, CP=Corporate, PF=Pension Fund, IB=Financial
+    Institution (bank), ID=Individual, MF=Mutual Fund, SC=Securities
+    Company, FD=Foundation, OT=Other. The two "Total" columns (Local
+    total, Foreign total) share the same header name, so they're renamed
+    below to keep them distinguishable in the sheet.
+    """
     session = get_ksei_session()
     resp = session.get(url, headers=PAGE_HEADERS, timeout=60)
     resp.raise_for_status()
@@ -454,13 +459,27 @@ def get_ksei_ownership_for_period(date_str, url):
                 continue
             with zf.open(name) as f:
                 raw = f.read()
-            # KSEI's own files have historically used ',', ';' or '|' -
-            # sniff it instead of assuming one.
             try:
-                df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+                df = pd.read_csv(io.BytesIO(raw), sep="|")
             except Exception as e:
-                print(f"  -> couldn't parse {name} in {url}: {e}")
-                continue
+                print(f"  -> couldn't parse {name} in {url} as pipe-delimited: {e}")
+                # fall back to sniffing, in case KSEI changes format later
+                try:
+                    df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+                except Exception as e2:
+                    print(f"  -> sniff fallback also failed: {e2}")
+                    continue
+
+            # pandas auto-suffixes the second duplicate "Total" column as
+            # "Total.1" - rename both to something meaningful.
+            cols = list(df.columns)
+            for i, col in enumerate(cols):
+                if col == "Total":
+                    cols[i] = "Local Total"
+                elif col == "Total.1":
+                    cols[i] = "Foreign Total"
+            df.columns = cols
+
             df["PeriodDate"] = period_date
             df["SourceFile"] = name
             frames.append(df)
