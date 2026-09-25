@@ -14,21 +14,31 @@ Required environment variables (set as GitHub Actions secrets):
     SPREADSHEET_ID              - the target Google Sheet's ID (from its URL)
 
 Optional:
-    SCRAPE_DATE   - YYYYMMDD, defaults to today (useful for backfilling/testing)
-    FUND_QUARTER  - fundamentals quarter (1-4), default 4
-    FUND_YEAR     - fundamentals fiscal year, default (current year - 1)
-    PROXY_URL     - e.g. http://user:pass@host:port - route all requests
-                    through this proxy. Use this if IDX's WAF is blocking
-                    GitHub Actions' shared runner IPs outright (see NOTE below).
+    SCRAPE_DATE      - YYYYMMDD, defaults to today (useful for backfilling/testing)
+    FUND_QUARTER     - fundamentals quarter (1-4), default 4
+    FUND_YEAR        - fundamentals fiscal year, default (current year - 1)
+    PROXY_URL        - e.g. http://user:pass@host:port - route all requests
+                       through this proxy.
+    FLARESOLVERR_URL - e.g. http://localhost:8191/v1 - a running FlareSolverr
+                       instance used to solve IDX's Cloudflare JS challenge
+                       once per run. Defaults to http://localhost:8191/v1,
+                       assuming FlareSolverr is running as a local Docker
+                       container on the same machine as this script (true
+                       for the self-hosted-runner setup this repo uses).
+                       Set to an empty string to disable and fall back to
+                       the plain curl_cffi warm-up (won't work if IDX is
+                       showing a JS challenge rather than a flat IP block).
 
 NOTE on 403 errors:
-    If even the warm-up request (a plain GET to the trading-summary page,
-    not the API) comes back 403, that's usually IDX's Cloudflare/WAF
-    blocking the IP address itself - not the request's fingerprint. This
-    is common for GitHub Actions' shared runner IPs, since they're
-    well-known datacenter ranges. Updating headers/impersonation (below)
-    won't fix an IP-level block; setting PROXY_URL to a residential/ISP
-    proxy, or moving the job to a self-hosted runner, will.
+    - A 403 with a generic/plain body usually means IDX's WAF is blocking
+      the request's IP or fingerprint outright.
+    - A 403 whose body contains "Just a moment..." is Cloudflare's actual
+      JS challenge page - it requires running real JavaScript in a real
+      browser to solve, which no amount of header/TLS-fingerprint tuning
+      can fake. That's what FLARESOLVERR_URL is for: it points at a local
+      FlareSolverr instance (a headless-browser-backed solver) that solves
+      the challenge once and hands back the resulting cookies, which this
+      script then reuses for the actual API calls.
 """
 
 import json
@@ -82,7 +92,35 @@ IMPERSONATE = "chrome131"
 PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@host:port
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
+FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191/v1")
+WARMUP_URL = "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham"
+
 _session = None
+
+
+def solve_with_flaresolverr(url):
+    """Ask a local FlareSolverr instance to load `url` in a real headless
+    browser and solve Cloudflare's JS challenge if one is shown. Returns
+    (cookies_dict, user_agent) so the caller can replay them on a normal
+    HTTP client instead of paying the browser-launch cost on every request."""
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": 60000}
+    resp = requests.post(
+        FLARESOLVERR_URL,
+        json=payload,
+        timeout=70,
+    )
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr did not solve the challenge: {data}")
+
+    solution = data["solution"]
+    cookies = {c["name"]: c["value"] for c in solution.get("cookies", [])}
+    user_agent = solution.get("userAgent") or PAGE_HEADERS["User-Agent"]
+    print(
+        f"FlareSolverr solved {url} -> status {solution.get('status')}, "
+        f"{len(cookies)} cookie(s) captured"
+    )
+    return cookies, user_agent
 
 
 def get_session():
@@ -92,19 +130,34 @@ def get_session():
     global _session
     if _session is None:
         _session = requests.Session(impersonate=IMPERSONATE, proxies=PROXIES)
+
+        if FLARESOLVERR_URL:
+            try:
+                cookies, user_agent = solve_with_flaresolverr(WARMUP_URL)
+                for name, value in cookies.items():
+                    _session.cookies.set(name, value, domain=".idx.co.id")
+                # Keep the UA consistent with whatever browser FlareSolverr
+                # actually used to solve the challenge - a mismatched UA vs.
+                # the cookie's originating fingerprint is itself a bot signal.
+                PAGE_HEADERS["User-Agent"] = user_agent
+                API_HEADERS["User-Agent"] = user_agent
+                print("Warm-up via FlareSolverr: cookies applied to session")
+                return _session
+            except Exception as e:
+                print(
+                    f"FlareSolverr warm-up failed ({e}); falling back to plain "
+                    "curl_cffi warm-up, which likely won't pass a JS challenge."
+                )
+
         try:
-            warmup = _session.get(
-                "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham",
-                headers=PAGE_HEADERS,
-                timeout=30,
-            )
+            warmup = _session.get(WARMUP_URL, headers=PAGE_HEADERS, timeout=30)
             print(f"Warm-up request status: {warmup.status_code}")
             if warmup.status_code == 403:
                 print(
                     "  -> 403 on the plain warm-up page (not the API) usually means "
-                    "the IP itself is blocked, not the request fingerprint. "
-                    "Try setting PROXY_URL to a residential/ISP proxy, or run this "
-                    "from a self-hosted runner instead of GitHub's shared runners."
+                    "either the IP is blocked, or IDX is showing a Cloudflare JS "
+                    "challenge that only a real browser (e.g. via FlareSolverr) "
+                    "can solve."
                 )
         except Exception as e:
             print(f"Warm-up request failed (continuing anyway): {e}")
