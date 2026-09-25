@@ -10,13 +10,25 @@ Meant to be run on a schedule by GitHub Actions (see
 only the code and the schedule. All data lands in Google Sheets.
 
 Required environment variables (set as GitHub Actions secrets):
-  GOOGLE_SERVICE_ACCOUNT_JSON  - full contents of the service account JSON key
-  SPREADSHEET_ID               - the target Google Sheet's ID (from its URL)
+    GOOGLE_SERVICE_ACCOUNT_JSON - full contents of the service account JSON key
+    SPREADSHEET_ID              - the target Google Sheet's ID (from its URL)
 
 Optional:
-  SCRAPE_DATE   - YYYYMMDD, defaults to today (useful for backfilling/testing)
-  FUND_QUARTER  - fundamentals quarter (1-4), default 4
-  FUND_YEAR     - fundamentals fiscal year, default (current year - 1)
+    SCRAPE_DATE   - YYYYMMDD, defaults to today (useful for backfilling/testing)
+    FUND_QUARTER  - fundamentals quarter (1-4), default 4
+    FUND_YEAR     - fundamentals fiscal year, default (current year - 1)
+    PROXY_URL     - e.g. http://user:pass@host:port - route all requests
+                    through this proxy. Use this if IDX's WAF is blocking
+                    GitHub Actions' shared runner IPs outright (see NOTE below).
+
+NOTE on 403 errors:
+    If even the warm-up request (a plain GET to the trading-summary page,
+    not the API) comes back 403, that's usually IDX's Cloudflare/WAF
+    blocking the IP address itself - not the request's fingerprint. This
+    is common for GitHub Actions' shared runner IPs, since they're
+    well-known datacenter ranges. Updating headers/impersonation (below)
+    won't fix an IP-level block; setting PROXY_URL to a residential/ISP
+    proxy, or moving the job to a self-hosted runner, will.
 """
 
 import json
@@ -34,10 +46,18 @@ BASE_URL = "https://www.idx.co.id/primary"
 PAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
 }
 
 API_HEADERS = {
@@ -45,13 +65,22 @@ API_HEADERS = {
     "Referer": "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "X-Requested-With": "XMLHttpRequest",
+    "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
 }
 
-IMPERSONATE = "chrome124"
+# Bump this if curl_cffi releases newer profiles later (chrome131 is the
+# latest that ships in curl_cffi 0.7.x/0.8.x at time of writing).
+IMPERSONATE = "chrome131"
+
+PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@host:port
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 _session = None
 
@@ -62,7 +91,7 @@ def get_session():
     accept API requests."""
     global _session
     if _session is None:
-        _session = requests.Session(impersonate=IMPERSONATE)
+        _session = requests.Session(impersonate=IMPERSONATE, proxies=PROXIES)
         try:
             warmup = _session.get(
                 "https://www.idx.co.id/id/data-pasar/ringkasan-perdagangan/ringkasan-saham",
@@ -70,6 +99,13 @@ def get_session():
                 timeout=30,
             )
             print(f"Warm-up request status: {warmup.status_code}")
+            if warmup.status_code == 403:
+                print(
+                    "  -> 403 on the plain warm-up page (not the API) usually means "
+                    "the IP itself is blocked, not the request fingerprint. "
+                    "Try setting PROXY_URL to a residential/ISP proxy, or run this "
+                    "from a self-hosted runner instead of GitHub's shared runners."
+                )
         except Exception as e:
             print(f"Warm-up request failed (continuing anyway): {e}")
     return _session
@@ -79,7 +115,12 @@ def fetch(path, params):
     session = get_session()
     url = f"{BASE_URL}{path}"
     resp = session.get(
-        url, params=params, headers=API_HEADERS, impersonate=IMPERSONATE, timeout=30
+        url,
+        params=params,
+        headers=API_HEADERS,
+        impersonate=IMPERSONATE,
+        proxies=PROXIES,
+        timeout=30,
     )
     if resp.status_code != 200:
         print(f"  -> {url} returned {resp.status_code}")
