@@ -182,6 +182,19 @@ def fetch(path, params):
     return resp.json()
 
 
+def default_scrape_date():
+    """Most recent day that's definitely a finished trading day: yesterday,
+    or the Friday before if today is a Monday (so weekends are skipped).
+    Doesn't know about Indonesian public holidays, so on a run right after
+    a holiday this may still land on a non-trading day and come back
+    empty - if that happens often enough to matter, this is the place to
+    plug in an actual IDX trading-calendar check."""
+    d = datetime.date.today() - datetime.timedelta(days=1)
+    while d.weekday() >= 5:  # Saturday=5, Sunday=6
+        d -= datetime.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+
 def today_str():
     return datetime.date.today().strftime("%Y%m%d")
 
@@ -237,8 +250,14 @@ def connect_sheet():
 
 
 def clean_for_sheets(df):
-    # gspread/Sheets can't take NaN/NaT - blank them out
-    return df.where(pd.notnull(df), None)
+    # gspread/Sheets can't take NaN/NaT - blank them out.
+    # astype(object) first is required: on a numeric-dtype column, pandas
+    # silently converts None back to NaN when you .where() into it, since
+    # a float64 column can't hold a real None. Casting to object dtype
+    # first makes the None actually stick, which is what avoids the
+    # downstream "Out of range float values are not JSON compliant: nan"
+    # error when gspread JSON-encodes the values for the Sheets API.
+    return df.astype(object).where(pd.notnull(df), None)
 
 
 def get_or_create_worksheet(spreadsheet, title, ncols):
@@ -297,7 +316,7 @@ def overwrite_snapshot(spreadsheet, title, df):
 
 
 def main():
-    date_str = os.environ.get("SCRAPE_DATE", today_str())
+    date_str = os.environ.get("SCRAPE_DATE", default_scrape_date())
     fund_quarter = os.environ.get("FUND_QUARTER", "4")
     fund_year = os.environ.get("FUND_YEAR", str(datetime.date.today().year - 1))
 
