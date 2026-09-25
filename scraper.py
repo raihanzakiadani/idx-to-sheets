@@ -33,6 +33,12 @@ Optional:
                             it's off by default - run it on its own
                             less-frequent schedule (e.g. weekly) rather
                             than every daily run.
+    KSEI_MONTHS_BACK      - how many of the most recent months of KSEI
+                            ownership data to (re-)fetch each run, default
+                            3. Already-ingested months are skipped by the
+                            de-dupe logic, so this just controls how far
+                            back a run reaches - bump it way up (e.g. 60)
+                            for a one-off historical backfill.
 
 NOTE on 403 errors:
     - A 403 with a generic/plain body usually means IDX's WAF is blocking
@@ -49,6 +55,9 @@ NOTE on 403 errors:
 import json
 import os
 import sys
+import re
+import io
+import zipfile
 import datetime
 
 import pandas as pd
@@ -381,6 +390,112 @@ def get_news(page_size=100):
     return pd.DataFrame(items)
 
 
+# --- KSEI monthly securities ownership (Local/Foreign x Insurance, Mutual
+# Fund, Pension Fund, Bank, Corporate, Individual, etc.) ------------------
+# This is a *different site* (ksei.co.id, not idx.co.id) and, as far as we
+# could confirm, isn't behind the same Cloudflare JS challenge - so it uses
+# its own plain curl_cffi session rather than the FlareSolverr-solved one.
+# We don't guess the monthly file's date (it's the last *trading* day of
+# the month, which shifts around and isn't simple weekday math) - instead
+# we scrape the actual download links off KSEI's own listing page.
+
+KSEI_LISTING_URL = "https://www.ksei.co.id/en/publication/data-and-statistics/securities-ownership"
+KSEI_ZIP_PATTERN = re.compile(r"BalanceposEfek(\d{8})\.zip")
+
+_ksei_session = None
+
+
+def get_ksei_session():
+    global _ksei_session
+    if _ksei_session is None:
+        _ksei_session = requests.Session(impersonate=IMPERSONATE)
+    return _ksei_session
+
+
+def get_ksei_download_links():
+    """Scrape (period_date, zip_url) pairs off KSEI's securities-ownership
+    listing page. Only returns what's linked on the (first) page - if KSEI
+    paginates further back than that, older months won't show up here."""
+    session = get_ksei_session()
+    resp = session.get(KSEI_LISTING_URL, headers=PAGE_HEADERS, timeout=30)
+    resp.raise_for_status()
+    links = []
+    for match in KSEI_ZIP_PATTERN.finditer(resp.text):
+        date_str = match.group(1)
+        url = f"https://www.ksei.co.id/storage/Download/BalanceposEfek{date_str}.zip"
+        links.append((date_str, url))
+    # de-dupe while keeping order (the pattern can appear more than once per link)
+    seen = set()
+    unique_links = []
+    for date_str, url in links:
+        if date_str not in seen:
+            seen.add(date_str)
+            unique_links.append((date_str, url))
+    return unique_links
+
+
+def get_ksei_ownership_for_period(date_str, url):
+    """Download+parse one month's ownership ZIP. We don't know KSEI's exact
+    internal CSV schema for certain (couldn't verify from this sandbox -
+    idx.co.id/ksei.co.id aren't reachable from here), so parsing is
+    intentionally generic: whatever columns are in the CSV are kept as-is,
+    with a PeriodDate column added. If the real column names turn out to
+    need cleanup, send a sample of what actually comes back and this can
+    be tightened up."""
+    session = get_ksei_session()
+    resp = session.get(url, headers=PAGE_HEADERS, timeout=60)
+    resp.raise_for_status()
+
+    period_date = f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    frames = []
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        for name in zf.namelist():
+            if not name.lower().endswith((".csv", ".txt")):
+                continue
+            with zf.open(name) as f:
+                raw = f.read()
+            # KSEI's own files have historically used ',', ';' or '|' -
+            # sniff it instead of assuming one.
+            try:
+                df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+            except Exception as e:
+                print(f"  -> couldn't parse {name} in {url}: {e}")
+                continue
+            df["PeriodDate"] = period_date
+            df["SourceFile"] = name
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_ksei_ownership(months_back=3):
+    """Pulls the most recent `months_back` months of ownership data that
+    are listed on KSEI's page. Safe to call every run - already-ingested
+    months get skipped downstream by upsert_timeseries's dedupe, so this
+    is how new months accumulate into history over time. Set
+    KSEI_MONTHS_BACK higher (e.g. 60) for a one-off deep backfill of
+    however much history KSEI's first listing page exposes."""
+    try:
+        links = get_ksei_download_links()
+    except Exception as e:
+        print(f"  -> couldn't load KSEI listing page: {e}")
+        return pd.DataFrame()
+
+    frames = []
+    for date_str, url in links[:months_back]:
+        try:
+            df = get_ksei_ownership_for_period(date_str, url)
+            if not df.empty:
+                frames.append(df)
+                print(f"  -> KSEI ownership {date_str}: {len(df)} row(s)")
+        except Exception as e:
+            print(f"  -> KSEI ownership fetch failed for {date_str}: {e}")
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def connect_sheet():
     creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     creds_dict = json.loads(creds_json)
@@ -523,6 +638,21 @@ def main():
         overwrite_snapshot(spreadsheet, "News", news_df)
     except Exception as e:
         print(f"News fetch failed: {e}", file=sys.stderr)
+
+    try:
+        months_back = int(os.environ.get("KSEI_MONTHS_BACK", "3"))
+        ksei_df = get_ksei_ownership(months_back=months_back)
+        if not ksei_df.empty:
+            # Column names come straight from KSEI's own CSV (see
+            # get_ksei_ownership_for_period) - PeriodDate is ours, plus
+            # whatever KSEI's first 2 columns are (typically an
+            # identifier + type) form the de-dupe key.
+            key_cols = ["PeriodDate"] + list(ksei_df.columns[:2])
+            upsert_timeseries(spreadsheet, "KSEIOwnership", ksei_df, key_cols)
+        else:
+            print("[KSEIOwnership] nothing fetched, skipping")
+    except Exception as e:
+        print(f"KSEIOwnership fetch failed: {e}", file=sys.stderr)
 
     # Heavy: one request per listed company (~962 of them). Off by default -
     # set FETCH_COMPANY_DETAILS=true (e.g. on a separate weekly workflow)
