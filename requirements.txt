@@ -1,4 +1,0 @@
-curl_cffi>=0.7
-pandas>=2.0
-gspread>=6.0
-google-auth>=2.30
