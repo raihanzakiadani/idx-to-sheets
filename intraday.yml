@@ -1,0 +1,39 @@
+name: Intraday Google Finance
+
+on:
+  schedule:
+    # Tiap 5 menit, 02:00-09:55 UTC = 09:00-16:55 WIB, Senin-Jumat.
+    # (script sendiri skip kalau di luar jam bursa)
+    - cron: "*/5 2-9 * * 1-5"
+  workflow_dispatch: {}
+
+# jangan jalan tumpang-tindih; kalau run sebelumnya belum selesai, run baru dilewati
+concurrency:
+  group: intraday
+  cancel-in-progress: false
+
+jobs:
+  intraday:
+    # Sengaja self-hosted: ~100 run/hari x ~1-2 menit akan menghabiskan kuota menit
+    # GitHub-hosted untuk repo private. Script ini tidak butuh FlareSolverr/curl_cffi.
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas numpy gspread google-auth
+
+      - name: Run intraday job
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PYTHONUNBUFFERED: "1"
+          INTRADAY_INTERVAL_MIN: "5"
+          INTRADAY_KEEP_DAYS: "30"
+          # INTRADAY_TICKERS: "BBCA,BBRI,TLKM"   # kosong = pakai tab Watchlist
+        run: python -u intraday_job.py

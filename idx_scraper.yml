@@ -1,0 +1,30 @@
+name: IDX to Google Sheets
+
+on:
+  schedule:
+    # 10:30 UTC = 17:30 WIB, Mon-Fri (after market close & settlement)
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: self-hosted
+    timeout-minutes: 180   # run pertama = backfill semua file kepemilikan saham, bisa lama
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PYTHONUNBUFFERED: "1"
+          # OWNERSHIP_START_DATE: "2026-01-30"
+          # OWNERSHIP_EXTRA_URLS: ""
+        run: python -u scraper.py
